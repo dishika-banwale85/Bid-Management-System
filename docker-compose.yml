@@ -1,0 +1,43 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bidease
+      POSTGRES_PASSWORD: bidease
+      POSTGRES_DB: bidease
+    ports: ["5432:5432"]
+    volumes: ["bidease_db:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bidease -d bidease"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports: ["1025:1025", "8025:8025"]
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://bidease:bidease@db:5432/bidease
+      JWT_SECRET: ${JWT_SECRET:-local-compose-change-this-secret}
+      FERNET_KEY: ${FERNET_KEY:-}
+      FRONTEND_ORIGIN: http://localhost:5173
+      UPLOAD_DIR: /app/private_uploads
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+      SMTP_FROM: ${SMTP_FROM:-no-reply@bidease.local}
+      SMTP_TLS: "false"
+      MAIL_MODE: ${MAIL_MODE:-simulate}
+    ports: ["8000:8000"]
+    volumes: ["bidease_uploads:/app/private_uploads"]
+    depends_on:
+      db: {condition: service_healthy}
+      mailhog: {condition: service_started}
+  frontend:
+    build: ./frontend
+    ports: ["5173:5173"]
+    depends_on: [backend]
+volumes:
+  bidease_db:
+  bidease_uploads:

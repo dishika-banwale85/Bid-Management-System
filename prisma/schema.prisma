@@ -1,0 +1,181 @@
+// PostgreSQL relational schema reference for BidEase's planned phases.
+// The Phase 1 FastAPI service currently uses SQLAlchemy; see README.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RequestStatus {
+  Draft
+  Submitted
+  InApproval
+  Approved
+  Rejected
+  Completed
+}
+
+model Role {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique @db.VarChar(60)
+  users     User[]
+  createdAt DateTime @default(now())
+}
+
+model User {
+  id           Int          @id @default(autoincrement())
+  email        String       @unique @db.VarChar(255)
+  fullName     String       @db.VarChar(160)
+  passwordHash String       @db.VarChar(255)
+  active       Boolean      @default(true)
+  roleId       Int
+  role         Role         @relation(fields: [roleId], references: [id])
+  bids         Bid[]        @relation("BidCreator")
+  requests     ComplianceRequest[] @relation("RequestCreator")
+  approvals    Approval[]
+  documents    Document[]
+  notifications Notification[]
+  auditLogs    AuditLog[]
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  @@index([roleId])
+}
+
+model Bid {
+  id                 Int          @id @default(autoincrement())
+  clientName         String       @db.VarChar(200)
+  department         String       @db.VarChar(160)
+  rfpReference       String       @db.VarChar(120)
+  tenderOpeningDate  DateTime     @db.Date
+  submissionDeadline DateTime     @db.Date
+  status             String       @default("In Progress") @db.VarChar(40)
+  createdById        Int
+  createdBy          User         @relation("BidCreator", fields: [createdById], references: [id])
+  requests           ComplianceRequest[]
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  @@index([clientName])
+  @@index([rfpReference])
+  @@index([submissionDeadline])
+  @@index([status])
+}
+
+model ComplianceRequest {
+  id          Int          @id @default(autoincrement())
+  bidId       Int
+  bid         Bid          @relation(fields: [bidId], references: [id], onDelete: Cascade)
+  creatorId   Int
+  creator     User         @relation("RequestCreator", fields: [creatorId], references: [id])
+  type        String       @db.VarChar(60)
+  status      RequestStatus @default(Draft)
+  formData    Json
+  approvals   Approval[]
+  documents   Document[]
+  notifications Notification[]
+  auditLogs   AuditLog[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  @@index([bidId, status])
+  @@index([creatorId])
+  @@index([type, status])
+}
+
+model WorkflowTemplate {
+  id        Int            @id @default(autoincrement())
+  requestType String       @unique @db.VarChar(60)
+  name      String         @db.VarChar(120)
+  active    Boolean        @default(true)
+  steps     WorkflowStep[]
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+}
+
+model WorkflowStep {
+  id         Int             @id @default(autoincrement())
+  templateId Int
+  template   WorkflowTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  order      Int
+  name       String          @db.VarChar(120)
+  roleName   String?         @db.VarChar(60)
+  assigneeId Int?
+  approvals  Approval[]
+  @@unique([templateId, order])
+  @@index([assigneeId])
+}
+
+model Approval {
+  id          Int              @id @default(autoincrement())
+  requestId   Int
+  request     ComplianceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  stepId      Int?
+  step        WorkflowStep?    @relation(fields: [stepId], references: [id])
+  approverId  Int
+  approver    User             @relation(fields: [approverId], references: [id])
+  decision    String           @db.VarChar(30)
+  comment     String?          @db.Text
+  decidedAt   DateTime         @default(now())
+  @@index([requestId, decidedAt])
+  @@index([approverId, decision])
+}
+
+model Document {
+  id          Int              @id @default(autoincrement())
+  requestId   Int
+  request     ComplianceRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  category    String           @db.VarChar(60)
+  filename    String           @db.VarChar(255)
+  storageKey  String           @unique @db.VarChar(255)
+  contentType String           @db.VarChar(120)
+  version     Int              @default(1)
+  uploadedById Int
+  uploadedBy  User             @relation(fields: [uploadedById], references: [id])
+  createdAt   DateTime         @default(now())
+  @@index([requestId, category, version])
+}
+
+model Contact {
+  id         Int      @id @default(autoincrement())
+  requestType String? @db.VarChar(60)
+  purpose    String   @db.VarChar(40)
+  name       String   @db.VarChar(160)
+  email      String   @db.VarChar(255)
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  @@index([requestType, purpose, active])
+}
+
+model Notification {
+  id         Int               @id @default(autoincrement())
+  userId     Int
+  user       User              @relation(fields: [userId], references: [id])
+  requestId  Int?
+  request    ComplianceRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  channel    String            @db.VarChar(20)
+  kind       String            @db.VarChar(60)
+  message    String            @db.Text
+  readAt     DateTime?
+  sentAt     DateTime?
+  createdAt  DateTime          @default(now())
+  @@index([userId, readAt, createdAt])
+  @@index([requestId])
+}
+
+model AuditLog {
+  id         Int               @id @default(autoincrement())
+  actorId    Int
+  actor      User              @relation(fields: [actorId], references: [id])
+  requestId  Int?
+  request    ComplianceRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  action     String            @db.VarChar(80)
+  entityType String            @db.VarChar(80)
+  entityId   Int
+  detail     Json
+  createdAt  DateTime          @default(now())
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([requestId])
+}
+ 

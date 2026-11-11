@@ -5,13 +5,25 @@ from zoneinfo import ZoneInfo
 from pydantic import AliasChoices, BaseModel, EmailStr, Field, ConfigDict, field_validator, model_validator
 from typing import Literal
 
-class TenderFeeData(BaseModel):
-    model_config=ConfigDict(extra="forbid")
-    client_name:str=Field(min_length=1); department:str=Field(min_length=1); mobile:str=Field(pattern=r"^\d{10}$")
-    contact_person:str=Field(min_length=1); landline:str=Field(min_length=1); email:EmailStr
-    beneficiary_name:str=Field(min_length=1); payment_mode:str=Field(min_length=1); relevant_rfp_pages:str=Field(min_length=1)
-    amount:float=Field(gt=0); account_holder_name:str=Field(min_length=1); account_number:str=Field(pattern=r"^\d{9,18}$")
-    branch_name:str=Field(min_length=1); ifsc:str=Field(pattern=r"^[A-Z]{4}0[A-Z0-9]{6}$"); branch_code:str=Field(min_length=1); micr:str=Field(pattern=r"^\d{9}$")
+class MailTrackingData(BaseModel):
+    mail_sent:Literal["Yes","No"]|None=None
+    mail_sent_to:str|None=Field(default=None,min_length=2,max_length=80)
+    mail_received:Literal["Yes","No"]|None=None
+    mail_received_from:str|None=Field(default=None,min_length=2,max_length=80)
+    mail_sent_on:date|None=None
+    mail_received_on:date|None=None
+    @field_validator("mail_sent_to","mail_received_from",mode="before")
+    @classmethod
+    def trim_mail_names(cls,value):
+        return value.strip() if isinstance(value,str) else value
+    @model_validator(mode="after")
+    def validate_mail_names(self):
+        if self.mail_sent=="Yes" and (not self.mail_sent_to or not self.mail_sent_to.strip()):raise ValueError("Sent to is required when request initiated is Yes")
+        if self.mail_received=="Yes" and (not self.mail_received_from or not self.mail_received_from.strip()):raise ValueError("Received from is required when final document received is Yes")
+        return self
+
+class TenderFeeData(MailTrackingData):
+    model_config=ConfigDict(extra="ignore")
 
 class EmdChallanData(TenderFeeData):
     address:str=Field(min_length=1); mode_of_approval:str=Field(min_length=1); approver_name:str=Field(min_length=1)
@@ -22,7 +34,7 @@ class EmdChallanData(TenderFeeData):
         if self.expected_refund_date <= self.last_emd_submission_date: raise ValueError("Expected refund date must be after last EMD submission date")
         return self
 
-class EmdBgData(BaseModel):
+class EmdBgData(MailTrackingData):
     model_config=ConfigDict(extra="forbid")
     engagement_code:str=Field(min_length=1); beneficiary_address:str=Field(min_length=1); mode_of_bg:str=Field(min_length=1)
     current_bg_maturity_date:date; tender_opening_date:date; contract_date:date; bg_amount:float=Field(gt=0)
@@ -33,25 +45,25 @@ class EmdBgData(BaseModel):
         if self.current_bg_maturity_date <= self.contract_date: raise ValueError("BG maturity date must be after contract date")
         return self
 
-class FinancialDocumentsData(BaseModel):
+class FinancialDocumentsData(MailTrackingData):
     # Ignore legacy draft keys (such as the removed purpose field) on resubmit.
     model_config=ConfigDict(extra="ignore")
     description:str=Field(min_length=1); documents_required:list[Literal["Balance Sheet","Turnover Certificate","CA Certificate","Net Worth Certificate","Other"]]=Field(min_length=1)
     financial_years:str=Field(min_length=1)
-class PowerOfAttorneyData(BaseModel):
+class PowerOfAttorneyData(MailTrackingData):
     # Ignore the removed legacy fields when a saved draft is resubmitted.
     model_config=ConfigDict(extra="ignore")
     signatory_name:str=Field(min_length=1)
     validity_period:int=Field(gt=0); rfp_format_attached:bool
-class DeclarationData(BaseModel):
+class DeclarationData(MailTrackingData):
     # Ignore the removed legacy Subject field when resubmitting an existing draft.
     model_config=ConfigDict(extra="ignore")
     declaration_type:Literal["Declaration","Undertaking","Self Declaration","Litigation","Blacklisting"]
     rfp_clause_reference:str=Field(min_length=1)
-class HRDocumentsData(BaseModel):
+class HRDocumentsData(MailTrackingData):
     model_config=ConfigDict(extra="forbid")
     certificate_type:Literal["Manpower Certificate","On-Roll Certificate"]; number_of_employees:int=Field(gt=0); details_required:str=Field(min_length=1)
-class OmsPaceRedflagData(BaseModel):
+class OmsPaceRedflagData(MailTrackingData):
     model_config=ConfigDict(extra="forbid")
     oms_created:Literal["Yes","No"]
     oms_id:str|None=None

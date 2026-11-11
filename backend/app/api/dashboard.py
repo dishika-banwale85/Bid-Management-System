@@ -152,6 +152,8 @@ def dashboard(
         bid = request.bid
         if bid is None or (bid_id and request.bid_id != bid_id):
             return False
+        if request.status == RequestStatus.DRAFT:
+            return False
         if request_type and request.type != request_type:
             return False
         if client_filter and client_filter not in (bid.client_name or "").casefold():
@@ -179,23 +181,47 @@ def dashboard(
     previous_bid_ids = {b.id for b in previous_bids}
 
     # One workflow query serves all roles. Only the relevant workflow step kind counts.
-    active_rows = []
-    if user.role.name in {"APPROVER", "PACE_COORDINATOR"}:
-        desired_kind = StepKind.APPROVAL if user.role.name == "APPROVER" else StepKind.ACTION
-        active_rows = db.execute(
-            select(RequestStep.request_id, ComplianceRequest.created_by)
-            .join(ComplianceRequest, ComplianceRequest.id == RequestStep.request_id)
-            .join(RequestStep.workflow_step)
-            .where(
-                RequestStep.status == StepStatus.ACTIVE,
-                ComplianceRequest.status == RequestStatus.IN_APPROVAL,
-                ComplianceRequest.created_by != user.id,
-                RequestStep.workflow_step.has(assigned_role=user.role.name, step_kind=desired_kind),
-            )
-        ).all()
-    pending_request_ids = {request_id for request_id, _ in active_rows}
-    approvals = len(request_ids & pending_request_ids)
-    previous_approvals = len(previous_request_ids & pending_request_ids)
+    # active_rows = []
+    # if user.role.name in {"APPROVER", "PACE_COORDINATOR"}:
+    #     desired_kind = StepKind.APPROVAL if user.role.name == "APPROVER" else StepKind.ACTION
+    #     active_rows = db.execute(
+    #         select(RequestStep.request_id, ComplianceRequest.created_by)
+    #         .join(ComplianceRequest, ComplianceRequest.id == RequestStep.request_id)
+    #         .join(RequestStep.workflow_step)
+    #         .where(
+    #             RequestStep.status == StepStatus.ACTIVE,
+    #             ComplianceRequest.status == RequestStatus.IN_APPROVAL,
+    #             ComplianceRequest.created_by != user.id,
+    #             RequestStep.workflow_step.has(assigned_role=user.role.name, step_kind=desired_kind),
+    #         )
+    #     ).all()
+    # pending_request_ids = {request_id for request_id, _ in active_rows}
+    # approvals = len(request_ids & pending_request_ids)
+    # previous_approvals = len(previous_request_ids & pending_request_ids)
+    def pace_approval_counts_for(requests):
+        matching = [
+            req for req in requests
+            if req.status != RequestStatus.DRAFT
+            and req.type == "OMS_PACE_REDFLAG"
+            and (req.form_data or {}).get("pace_created") == "Yes"
+        ]
+        return {
+            "pending": sum(
+                1 for req in matching
+                if (req.form_data or {}).get("approval_status") == "PENDING"
+            ),
+            "approved": sum(
+                1 for req in matching
+                if (req.form_data or {}).get("approval_status") == "APPROVED"
+            ),
+        }
+
+    pace_approval_counts = pace_approval_counts_for(selected_requests)
+    previous_pace_approval_counts = pace_approval_counts_for(previous_requests)
+    approvals = pace_approval_counts["pending"]
+    previous_approvals = previous_pace_approval_counts["pending"]
+
+    
 
     def overdue_sets(requests, bids):
         bid_overdue = [b for b in bids if b.submission_deadline < today and _effective_bid_status(b, requests_by_bid.get(b.id, [])) != "COMPLETED"]
@@ -208,6 +234,7 @@ def dashboard(
                 refunds.append((req, expected))
         return bid_overdue, refunds
 
+
     overdue_bids, overdue_refunds = overdue_sets(selected_requests, selected_bids)
     previous_overdue_bids, previous_overdue_refunds = overdue_sets(previous_requests, previous_bids)
     overdue_value = len(overdue_bids) + len(overdue_refunds)
@@ -215,7 +242,10 @@ def dashboard(
 
     # The checklist helper performs one aggregate query for every visible bid.
     rollups = _checklist_rollups(db, selected_bid_ids, exclude_drafts=True)
-    counts_by_status = Counter(_effective_bid_status(b, requests_by_bid.get(b.id, [])) for b in selected_bids)
+    counts_by_status = Counter(
+    b.bid_status.value if hasattr(b.bid_status, "value") else str(b.bid_status)
+    for b in selected_bids
+    )
     requests_by_type = Counter(r.type for r in selected_requests)
 
     completion_ranges = [("0-25%", 0, 25), ("26-50%", 26, 50), ("51-75%", 51, 75), ("76-100%", 76, 100)]
@@ -338,6 +368,7 @@ def dashboard(
         "pagination": {"page": page, "page_size": page_size, "total": page_total, "pages": (page_total+page_size-1)//page_size},
         "filters": {"date_from": start.isoformat(), "date_to": end.isoformat(), "client": client, "request_type": request_type, "tab": tab, "clients": client_options},
         "kpis": kpis,
+        "pace_approval_counts": pace_approval_counts,
         "bids_by_status": bids_by_status,
         "requests_by_type": requests_by_type_data,
         "completion_buckets": completion_buckets,

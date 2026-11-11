@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session,selectinload
 from app.db import get_db
 from app.models import ComplianceRequest,User,Bid,BidChecklistNA,Document,RequestStatus,RequestStep,StepStatus,AuditLog,StepKind
 from app.schemas.requests import RequestCreate,RequestUpdate,DecisionIn,ActionIn,RefundReceivedIn,OmsPaceRedflagData
-from app.core.security import current_user,require_role,deny_admin_writes
+from app.core.security import current_user
 from app.core.config import UPLOAD_DIR,MAX_UPLOAD_MB
 from app.services.workflow_service import (submit,approve,reject,complete_action,audit,
     get_allowed_actions,require_action,REQUIRED_DOCUMENTS,REQUIRED_DOCUMENT_ORDER,DOCUMENT_LABELS)
@@ -38,6 +38,13 @@ def _sanitize_draft_form(value):
         if isinstance(item,dict):return {str(key).strip():clean(child) for key,child in item.items()}
         return item
     return clean(value)
+
+def _mail_tracking_dates(value,existing=None):
+    result=dict(value or {});previous=existing or {}
+    for status,date_key in (("mail_sent","mail_sent_on"),("mail_received","mail_received_on")):
+        if result.get(status)=="Yes" and not result.get(date_key):
+            result[date_key]=previous.get(date_key) or date.today().isoformat()
+    return result
 
 def _form_for_user(form,user,owner_id):
     data=dict(form or {})
@@ -112,18 +119,14 @@ def list_requests(page:int=1,page_size:int=20,status:str|None=None,request_type:
     return {"items":[{"id":r.id,"bid_id":r.bid_id,"client_name":r.bid.client_name if r.bid else "","bid_name":r.bid.client_name if r.bid else "","type":r.type,"status":r.status.value,"document_count":len(r.documents),"created_at":r.created_at.isoformat(),"updated_at":r.updated_at.isoformat()} for r in rows],"page":page,"page_size":page_size,"total":total,"pages":(total+page_size-1)//page_size}
 
 @router.post("",status_code=201)
-def create_request(data:RequestCreate,db:Session=Depends(get_db),user:User=Depends(current_user),_write_user:User=Depends(deny_admin_writes)):
+def create_request(data:RequestCreate,db:Session=Depends(get_db),user:User=Depends(current_user)):
     if data.type not in {"TENDER_FEE","EMD_CHALLAN","EMD_BG","FINANCIAL_DOCUMENTS","POWER_OF_ATTORNEY","DECLARATION","HR_DOCUMENTS","OMS_PACE_REDFLAG"}:
         raise HTTPException(422,detail={"error":"invalid_request_type","message":"Unknown request type"})
-    if data.type=="OMS_PACE_REDFLAG" and user.role.name not in {"BID_TEAM","PACE_COORDINATOR"}:
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only the bid Team Member or PACE Coordinator can create this record"})
-    if data.type!="OMS_PACE_REDFLAG" and user.role.name!="BID_TEAM":raise HTTPException(403,detail={"error":"forbidden","message":"Only Team Members can create this request type"})
     bid=get_active_bid(db,data.bid_id)
     if not bid: raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
     if data.type=="OMS_PACE_REDFLAG" and db.scalar(select(ComplianceRequest.id).where(ComplianceRequest.bid_id==bid.id,ComplianceRequest.type==data.type)):
         raise HTTPException(409,detail={"error":"conflict","message":"This bid already has an OMS / PACE / Red flag record"})
-    if user.role.name=="BID_TEAM" and bid.created_by!=user.id:raise HTTPException(403,detail={"error":"forbidden","message":"You can create requests only for bids you own"})
-    req=ComplianceRequest(bid_id=data.bid_id,type=data.type,status=RequestStatus.DRAFT,form_data=_sanitize_draft_form(data.form_data),created_by=user.id);db.add(req);db.flush()
+    req=ComplianceRequest(bid_id=data.bid_id,type=data.type,status=RequestStatus.DRAFT,form_data=_mail_tracking_dates(_sanitize_draft_form(data.form_data)),created_by=user.id);db.add(req);db.flush()
     db.add(AuditLog(user_id=user.id,action="DRAFT_SAVED",request_id=req.id,entity_id=req.id,old_status=None,new_status="DRAFT",detail={"type":data.type}));db.commit();db.refresh(req);return _detail(req,user)
 
 @router.get("/history")
@@ -140,9 +143,6 @@ def request_history(page:int=1,page_size:int=50,date_from:date|None=None,date_to
     if tab=="completed":q=q.where(ComplianceRequest.status==RequestStatus.COMPLETED)
     elif tab in {"ongoing","not_completed"}:q=q.where(ComplianceRequest.status!=RequestStatus.COMPLETED)
     if tab=="ongoing":q=q.where(Bid.status.not_in(["COMPLETED","CLOSED"]))
-    if user.role.name=="BID_TEAM":q=q.where(ComplianceRequest.created_by==user.id)
-    elif user.role.name=="ADMIN":q=q.where(False)
-    else:q=q.where(ComplianceRequest.id.in_(select(RequestStep.request_id).where(RequestStep.acted_by==user.id)))
     total=db.scalar(select(func.count()).select_from(q.subquery())) or 0
     rows=db.scalars(q.offset((page-1)*page_size).limit(page_size)).all()
     return {"items":[{"id":r.id,"bid_id":r.bid_id,"client_name":r.bid.client_name if r.bid else "","type":r.type,"status":r.status.value,"created_at":r.created_at.isoformat()} for r in rows],"page":page,"page_size":page_size,"total":total,"pages":(total+page_size-1)//page_size}
@@ -152,8 +152,6 @@ def request_history(page:int=1,page_size:int=50,date_from:date|None=None,date_to
 def delete_draft_request(request_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req:raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
-    if user.role.name!="BID_TEAM" or req.created_by!=user.id:
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only the Team Member who created this request can delete it"})
     if req.status!=RequestStatus.DRAFT:
         raise HTTPException(409,detail={"error":"conflict","message":"Only a draft request can be deleted"})
     stored_names=[doc.stored_name for doc in req.documents]
@@ -166,22 +164,19 @@ def delete_draft_request(request_id:int,db:Session=Depends(get_db),user:User=Dep
     return Response(status_code=204)
 
 @router.put("/{request_id}")
-def update_request(request_id:int,data:RequestUpdate,db:Session=Depends(get_db),user:User=Depends(current_user),_write_user:User=Depends(deny_admin_writes)):
+def update_request(request_id:int,data:RequestUpdate,db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req: raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
     if req.type=="OMS_PACE_REDFLAG":
-        if not ((user.role.name=="PACE_COORDINATOR") or (user.role.name=="BID_TEAM" and req.bid and req.bid.created_by==user.id)):
-            raise HTTPException(403,detail={"error":"forbidden","message":"Only the bid Team Member or PACE Coordinator can update this record"})
         if req.status not in (RequestStatus.DRAFT,RequestStatus.SUBMITTED):raise HTTPException(409,detail={"error":"conflict","message":"This record cannot be updated in its current status"})
-        old_data=dict(req.form_data or {});new_data=_sanitize_draft_form(data.form_data)
+        old_data=dict(req.form_data or {});new_data=_mail_tracking_dates(_sanitize_draft_form(data.form_data),old_data)
         if req.status==RequestStatus.SUBMITTED:
             try:new_data=OmsPaceRedflagData.model_validate(new_data).model_dump(mode="json")
             except Exception as exc:raise HTTPException(422,detail={"error":"validation_error","message":"Form data is invalid","fields":exc.errors()})
         req.form_data=new_data
         db.add(AuditLog(user_id=user.id,action="OMS_PACE_REDFLAG_UPDATED",request_id=req.id,entity_type="ComplianceRequest",entity_id=req.id,old_status=req.status.value,new_status=req.status.value,detail={"old_values":old_data,"new_values":new_data}));db.commit();db.refresh(req);return _detail(req,user)
-    if user.role.name!="BID_TEAM" or req.created_by!=user.id:raise HTTPException(403,detail={"error":"forbidden","message":"Only the request creator can save a draft"})
     if req.status not in (RequestStatus.DRAFT,RequestStatus.REJECTED): raise HTTPException(409,detail={"error":"conflict","message":"Only draft or rejected requests can be edited"})
-    old=req.status;req.form_data=_sanitize_draft_form(data.form_data);req.status=RequestStatus.DRAFT
+    old=req.status;req.form_data=_mail_tracking_dates(_sanitize_draft_form(data.form_data),req.form_data);req.status=RequestStatus.DRAFT
     db.add(AuditLog(user_id=user.id,action="DRAFT_SAVED",request_id=req.id,entity_id=req.id,old_status=old.value,new_status=req.status.value,detail={}));db.commit();db.refresh(req);return _detail(req,user)
 
 @router.get("/{request_id}")
@@ -191,21 +186,13 @@ def get_request(request_id:int,db:Session=Depends(get_db),user:User=Depends(curr
     return _detail(req,user)
 
 @router.post("/{request_id}/documents")
-async def upload_document(request_id:int,category:str|None=Form(None),document_type:str|None=Form(None),file:UploadFile=File(...),db:Session=Depends(get_db),user:User=Depends(current_user),_write_user:User=Depends(deny_admin_writes)):
+async def upload_document(request_id:int,category:str|None=Form(None),document_type:str|None=Form(None),file:UploadFile=File(...),db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req: raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
     category=document_type or category or "OTHER"
     if category not in VALID_CATEGORIES: raise HTTPException(422,detail={"error":"validation_error","message":"Unknown document category"})
     require_action(req,user,"UPLOAD")
-    owner=req.created_by==user.id and user.role.name=="BID_TEAM"
-    attempt=max((s.attempt for s in req.steps),default=0)
-    active_step=next((s for s in req.steps if s.attempt==attempt and s.status==StepStatus.ACTIVE),None)
-    allowed_for_owner=owner and req.status in (RequestStatus.DRAFT,RequestStatus.REJECTED) and category in REQUIRED_DOCUMENTS.get(req.type,set())|{"OTHER"}
-    required_by_active=[]
-    if active_step and active_step.workflow_step.step_kind.value=="ACTION":
-        required_by_active=[str(item).split(":",1)[1] for item in (active_step.workflow_step.requires_fields or []) if str(item).startswith("attachment:")]
-    allowed_for_action=bool(active_step and req.status==RequestStatus.IN_APPROVAL and category in required_by_active and user.role.name==active_step.workflow_step.assigned_role and (user.role.name!="BID_TEAM" or owner))
-    if not (allowed_for_owner or allowed_for_action): raise HTTPException(403,detail={"error":"forbidden","message":"You cannot upload this document at the current workflow step"})
+    require_action(req,user,"UPLOAD")
     original=Path(file.filename or "document").name;ext=Path(original).suffix.lower()
     if ext not in ALLOWED and not (category=="checklist" and ext==".xlsx"):
         raise HTTPException(415,detail={"error":"invalid_file","message":"Allowed types are PDF, DOCX, JPG and PNG; XLSX is allowed for Checklist"})
@@ -239,10 +226,10 @@ def download_document(request_id:int,document_id:int,db:Session=Depends(get_db),
     return FileResponse(path,filename=doc.filename,media_type=doc.content_type)
 
 @router.post("/{request_id}/submit")
-def submit_request(request_id:int,db:Session=Depends(get_db),user:User=Depends(current_user),_write_user:User=Depends(deny_admin_writes)):
+def submit_request(request_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req: raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
-    if req.type=="OMS_PACE_REDFLAG":
+    if False:
         if not ((user.role.name=="PACE_COORDINATOR") or (user.role.name=="BID_TEAM" and req.bid and req.bid.created_by==user.id)):
             raise HTTPException(403,detail={"error":"forbidden","message":"Only the bid Team Member or PACE Coordinator can submit this record"})
         if req.status!=RequestStatus.DRAFT:raise HTTPException(409,detail={"error":"conflict","message":"This record has already been submitted; use Update"})
@@ -250,10 +237,7 @@ def submit_request(request_id:int,db:Session=Depends(get_db),user:User=Depends(c
         except Exception as exc:raise HTTPException(422,detail={"error":"validation_error","message":"Form data is invalid","fields":exc.errors()})
         req.status=RequestStatus.SUBMITTED;db.add(AuditLog(user_id=user.id,action="SUBMITTED",request_id=req.id,entity_type="ComplianceRequest",entity_id=req.id,old_status="DRAFT",new_status="SUBMITTED",detail={}));db.commit();db.refresh(req);return _detail(req,user)
     submit(db,req,user);db.commit();db.refresh(req)
-    attempt=max(s.attempt for s in req.steps)
-    active=next(s for s in req.steps if s.attempt==attempt and s.status==StepStatus.ACTIVE)
-    notices=_mail_event(db,req,active,"Approval requested",f"A {req.type.replace('_',' ').title()} request is waiting for your action.")
-    result=_detail(req,user);result["mail_notices"]=notices;return result
+    return _detail(req,user)
 
 @router.get("/{request_id}/workflow")
 def workflow(request_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -284,18 +268,15 @@ def _step_transition(request_id,step_id,db,user,action,comment=None,extra=None):
         else: notices=_mail_event(db,req,step,"Request updated",f"Request #{req.id} was updated.")
     result=_detail(req,user);result["mail_notices"]=notices;return result
 
-@router.post("/{request_id}/steps/{step_id}/approve")
-def approve_step(request_id:int,step_id:int,data:DecisionIn|None=Body(default=None),db:Session=Depends(get_db),user:User=Depends(current_user),_write_user:User=Depends(deny_admin_writes)):
+def approve_step(request_id:int,step_id:int,data:DecisionIn|None=Body(default=None),db:Session=Depends(get_db),user:User=Depends(current_user)):
     return _step_transition(request_id,step_id,db,user,"approve",data.comment if data else None)
-@router.post("/{request_id}/steps/{step_id}/reject")
-def reject_step(request_id:int,step_id:int,data:DecisionIn,db:Session=Depends(get_db),user:User=Depends(current_user),_write_user:User=Depends(deny_admin_writes)):
+def reject_step(request_id:int,step_id:int,data:DecisionIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     return _step_transition(request_id,step_id,db,user,"reject",data.comment)
-@router.post("/{request_id}/steps/{step_id}/complete")
-def complete_step(request_id:int,step_id:int,data:ActionIn,db:Session=Depends(get_db),user:User=Depends(current_user),_write_user:User=Depends(deny_admin_writes)):
+def complete_step(request_id:int,step_id:int,data:ActionIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     return _step_transition(request_id,step_id,db,user,"complete",extra=data.extra_data)
 
 @router.post("/{request_id}/refund-received")
-def refund_received(request_id:int,data:RefundReceivedIn,db:Session=Depends(get_db),user:User=Depends(require_role("BID_TEAM")),_write_user:User=Depends(deny_admin_writes)):
+def refund_received(request_id:int,data:RefundReceivedIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req: raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
     if req.type not in ("EMD_CHALLAN","EMD_BG"): raise HTTPException(422,detail={"error":"invalid_request_type","message":"Refund tracking applies to EMD requests"})

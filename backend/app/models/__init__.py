@@ -100,6 +100,7 @@ class ComplianceRequest(Base):
     bid_id: Mapped[int]=mapped_column(ForeignKey("bids.id",ondelete="CASCADE"),index=True)
     type: Mapped[str]=mapped_column(String(40),index=True)
     status: Mapped[RequestStatus]=mapped_column(Enum(RequestStatus,native_enum=False,length=20),default=RequestStatus.DRAFT,index=True)
+    legacy_status: Mapped[str|None]=mapped_column(String(20),nullable=True)
     form_data: Mapped[dict]=mapped_column(EncryptedJSON(),default=dict)
     created_by: Mapped[int]=mapped_column(ForeignKey("users.id"),index=True)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)

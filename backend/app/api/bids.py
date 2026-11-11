@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.security import current_user, require_role
+from app.core.security import current_user
 from app.core.config import UPLOAD_DIR
 from app.db import get_db
 from app.models import AuditLog, Bid, BidChecklistNA, BidDocument, BidStatus, ComplianceRequest, Document, RequestStatus, User
@@ -29,15 +29,11 @@ class BidDeleteIn(BaseModel):
 
 
 def _delete_permissions(bid, user, submitted_count):
-    admin = user.role.name == "ADMIN"
-    creator = user.role.name == "BID_TEAM" and bid.created_by == user.id
-    control = admin or creator
-    can_delete = admin or (creator and submitted_count == 0)
+    control = True
+    can_delete = submitted_count == 0
     reason = None
-    if not control:
-        reason = "Only the bid creator or an Admin can move this bid to Trash."
-    elif creator and submitted_count:
-        reason = f"This bid has {submitted_count} submitted compliance request(s) and cannot be deleted by a Team Member."
+    if submitted_count:
+        reason = f"This bid has {submitted_count} submitted compliance request(s) and cannot be moved to Trash."
     return can_delete, control, reason
 
 
@@ -107,7 +103,7 @@ def bid_json(b,user=None,checklist=None,stats=None):
         "status":b.status,
         "bid_status":b.bid_status.value if hasattr(b.bid_status,"value") else b.bid_status,
         "rfp":{"id":b.rfp_document.id,"filename":b.rfp_document.original_name,"size":b.rfp_document.size,"uploaded_at":b.rfp_document.uploaded_at.isoformat()} if b.rfp_document else None,
-        "can_manage_bid":bool(user and user.role.name=="BID_TEAM" and user.id==b.created_by),
+        "can_manage_bid":bool(user),
         "request_count":total,
         "completed_count":complete,
         "progress":round(complete*100/total) if total else 0,
@@ -167,11 +163,8 @@ def check_rfp(rfp_number:str=Query(min_length=1,max_length=120),exclude_bid_id:i
 
 @router.get("/trash")
 def list_bid_trash(page:int=1,page_size:int=20,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    if user.role.name not in {"BID_TEAM","ADMIN"}:
-        raise HTTPException(403,detail={"error":"forbidden","message":"Trash is available to Team Members and Admins"})
     page=max(1,page);page_size=min(100,max(1,page_size))
     statement=select(Bid,User.full_name).outerjoin(User,User.id==Bid.deleted_by).where(Bid.deleted_at.is_not(None))
-    if user.role.name=="BID_TEAM":statement=statement.where(Bid.created_by==user.id)
     total=db.scalar(select(func.count()).select_from(statement.subquery())) or 0
     rows=db.execute(statement.order_by(Bid.deleted_at.desc()).offset((page-1)*page_size).limit(page_size)).all()
     stats=bid_request_stats(db,[bid.id for bid,_ in rows])
@@ -255,12 +248,8 @@ async def _parse_create_bid(request:Request):
 
 
 @router.post("",response_model=BidOut,status_code=201)
-async def create_bid(request:Request,db:Session=Depends(get_db),user:User=Depends(require_role("BID_TEAM","ADMIN"))):
+async def create_bid(request:Request,db:Session=Depends(get_db),user:User=Depends(current_user)):
     data,uploaded,raw,file_info=await _parse_create_bid(request)
-    if uploaded and user.role.name!="BID_TEAM":
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only the Team Member who creates the bid can upload its RFP"})
-    if user.role.name=="ADMIN" and data.bid_status!=BidStatus.NOT_SUBMITTED:
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only Team Members can set the bid status"})
     if data.bid_status==BidStatus.SUBMITTED and not uploaded:
         raise HTTPException(422,detail={"error":"rfp_required","message":"Attach the RFP before marking this bid as Submitted"})
     _validate_create_dates(data)
@@ -295,7 +284,7 @@ def get_bid(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_user
     bid=db.scalar(select(Bid).options(selectinload(Bid.requests),selectinload(Bid.rfp_document)).where(Bid.id==bid_id,bid_visibility_clause(user)))
     if not bid:
         deleted=db.scalar(select(Bid).where(Bid.id==bid_id,Bid.deleted_at.is_not(None)))
-        if deleted and (user.role.name=="ADMIN" or (user.role.name=="BID_TEAM" and user.id==deleted.created_by)):
+        if deleted:
             raise HTTPException(404,detail={"error":"bid_deleted","message":"This bid was deleted"})
         raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
     return {**bid_json(bid,user,_checklist_rollups(db,[bid.id]).get(bid.id),bid_request_stats(db,[bid.id]).get(bid.id)),"requests":[{"id":r.id,"type":r.type,"status":r.status.value,"created_at":r.created_at.isoformat()} for r in bid.requests if can_view_request(r,user)]}
@@ -305,8 +294,6 @@ def _owned_bid_for_rfp_write(db:Session,bid_id:int,user:User)->Bid:
     bid=get_active_bid(db,bid_id)
     if bid is None:
         raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
-    if user.role.name!="BID_TEAM" or bid.created_by!=user.id:
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only the Team Member who created this bid can manage its RFP"})
     return bid
 
 
@@ -364,19 +351,12 @@ def remove_bid_rfp(bid_id:int,db:Session=Depends(get_db),user:User=Depends(curre
 
 @router.delete("/{bid_id}")
 def move_bid_to_trash(bid_id:int,data:BidDeleteIn|None=Body(default=None),db:Session=Depends(get_db),user:User=Depends(current_user)):
-    if user.role.name not in {"BID_TEAM","ADMIN"}:
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only the bid creator or Admin can move a bid to Trash"})
     bid=get_active_bid(db,bid_id)
     if bid is None:raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
     submitted_count=db.scalar(select(func.count(ComplianceRequest.id)).where(ComplianceRequest.bid_id==bid.id,ComplianceRequest.status!=RequestStatus.DRAFT)) or 0
-    if user.role.name=="BID_TEAM":
-        if bid.created_by!=user.id:
-            raise HTTPException(403,detail={"error":"forbidden","message":"You can move only bids you created to Trash"})
-        if submitted_count:
-            raise HTTPException(409,detail={"error":"conflict","message":f"This bid has {submitted_count} submitted compliance request(s) and cannot be deleted by a Team Member.","submitted_request_count":submitted_count})
+    if submitted_count:
+        raise HTTPException(409,detail={"error":"conflict","message":f"This bid has {submitted_count} submitted compliance request(s) and cannot be moved to Trash.","submitted_request_count":submitted_count})
     reason=(data.reason or "").strip() if data else ""
-    if user.role.name=="ADMIN" and len(reason)<5:
-        raise HTTPException(422,detail={"error":"validation_error","message":"Admin delete reason must be at least 5 characters"})
     bid.deleted_at=datetime.now(timezone.utc);bid.deleted_by=user.id;bid.delete_reason=reason or None
     db.add(AuditLog(user_id=user.id,action="BID_MOVED_TO_TRASH",entity_type="Bid",entity_id=bid.id,detail={"rfp_reference":bid.rfp_reference,"delete_reason":bid.delete_reason,"draft_request_count":int(db.scalar(select(func.count(ComplianceRequest.id)).where(ComplianceRequest.bid_id==bid.id,ComplianceRequest.status==RequestStatus.DRAFT)) or 0),"submitted_request_count":int(submitted_count)}))
     db.commit()
@@ -385,12 +365,8 @@ def move_bid_to_trash(bid_id:int,data:BidDeleteIn|None=Body(default=None),db:Ses
 
 @router.post("/{bid_id}/restore")
 def restore_bid(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    if user.role.name not in {"BID_TEAM","ADMIN"}:
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only the bid creator or Admin can restore a bid"})
     bid=db.scalar(select(Bid).where(Bid.id==bid_id,Bid.deleted_at.is_not(None)))
     if bid is None:raise HTTPException(409,detail={"error":"conflict","message":"This bid is not in Trash"})
-    if user.role.name=="BID_TEAM" and bid.created_by!=user.id:
-        raise HTTPException(403,detail={"error":"forbidden","message":"You can restore only bids you created"})
     conflict=db.scalar(select(Bid.id).where(func.lower(Bid.rfp_reference)==bid.rfp_reference.lower(),active_bid_clause(),Bid.id!=bid.id))
     if conflict:
         raise HTTPException(409,detail={"error":"conflict","message":"Another active bid already uses this RFP number. Change that bid's RFP number before restoring."})
@@ -402,8 +378,6 @@ def restore_bid(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_
 
 @router.delete("/{bid_id}/permanent",status_code=204)
 def permanently_delete_bid_route(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    if user.role.name!="ADMIN":
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only Admin can permanently delete bids"})
     bid=db.get(Bid,bid_id)
     if bid is None:raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
     if bid.deleted_at is None:
@@ -445,15 +419,13 @@ def get_bid_checklist(bid_id:int,db:Session=Depends(get_db),user:User=Depends(cu
         attached_total+=attached_count
         type_data.append({"request_type":request_type,"label":TYPE_LABELS.get(request_type,request_type.replace("_"," ").title()),"applicable":applicable,"state":state,"requests":document_groups,"required_count":required_count,"attached_count":attached_count})
     missing_total=max(0,required_total-attached_total)
-    return {"bid_id":bid.id,"request_types":type_data,"required_total":required_total,"attached_total":attached_total,"missing_total":missing_total,"percent":int(attached_total*100/required_total+0.5) if required_total else 0,"can_mark_na":user.role.name=="BID_TEAM" and bid.created_by==user.id}
+    return {"bid_id":bid.id,"request_types":type_data,"required_total":required_total,"attached_total":attached_total,"missing_total":missing_total,"percent":int(attached_total*100/required_total+0.5) if required_total else 0,"can_mark_na":True}
 
 
 @router.put("/{bid_id}/checklist/na")
 def set_checklist_applicability(bid_id:int,data:BidChecklistNAIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     bid=get_active_bid(db,bid_id)
     if not bid:raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
-    if user.role.name!="BID_TEAM" or bid.created_by!=user.id:
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only the bid creator can mark a request type not applicable"})
     if data.request_type not in REQUIRED_DOCUMENT_ORDER:
         raise HTTPException(422,detail={"error":"invalid_request_type","message":"This request type is not active"})
     existing=db.get(BidChecklistNA,(bid_id,data.request_type))
@@ -476,10 +448,6 @@ def update_bid(bid_id:int,data:BidUpdate,db:Session=Depends(get_db),user:User=De
     bid=get_active_bid(db,bid_id)
     if not bid:
         raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
-    if user.role.name!="BID_TEAM":
-        raise HTTPException(403,detail={"error":"forbidden","message":"Only Team Members can edit bids"})
-    if bid.created_by!=user.id:
-        raise HTTPException(403,detail={"error":"forbidden","message":"You can edit only bids you own"})
     changes=data.model_dump(exclude_unset=True)
     if changes.get("bid_status")==BidStatus.SUBMITTED and not bid.rfp_document:
         raise HTTPException(422,detail={"error":"rfp_required","message":"Attach the RFP before marking this bid as Submitted"})

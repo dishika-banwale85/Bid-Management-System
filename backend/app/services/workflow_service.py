@@ -12,43 +12,28 @@ REQUIRED_DOCUMENT_ORDER={"TENDER_FEE":["generated_challan","checklist"],"EMD_CHA
 DOCUMENT_LABELS={"generated_challan":"Generated Challan","checklist":"Checklist","bg_format":"BG Format","ca_certificate":"CA Certificate","final_approval":"Final Approval","poa_format":"POA Format","executed_poa":"Executed / Notarized POA","required_document_format":"Format of required document","rfp":"RFP","ep_approval":"EP Approval","bg_copy":"Bank Guarantee copy","rfp_format":"RFP format document","financial_documents":"Financial documents","signed_declaration":"Signed declaration","hr_certificate":"HR certificate"}
 
 def get_allowed_actions(req:ComplianceRequest,user:User)->list[str]:
-    """Return exactly the request mutations this user can perform right now."""
-    role=user.role.name
-    if role=="ADMIN":return []
+    """Return request mutations available to any authenticated user."""
     if req.type=="OMS_PACE_REDFLAG":
-        owner=(role=="BID_TEAM" and req.bid and req.bid.created_by==user.id)
-        if owner or role=="PACE_COORDINATOR":
-            return ["EDIT","UPDATE"] if req.status!=RequestStatus.DRAFT else ["EDIT","SUBMIT","UPDATE"]
-        return []
-    owner=role=="BID_TEAM" and req.created_by==user.id
-    actions=[]
-    if owner and req.status in (RequestStatus.DRAFT,RequestStatus.REJECTED):
-        actions.extend(["EDIT","UPLOAD","SUBMIT"])
-    if owner and req.status==RequestStatus.DRAFT:
-        actions.append("DELETE")
-    if owner and req.status==RequestStatus.COMPLETED and req.type in ("EMD_CHALLAN","EMD_BG") and not req.refund_received_at:
-        actions.append("REFUND_RECEIVED")
-    attempt=max((s.attempt for s in req.steps),default=0)
-    active=next((s for s in req.steps if s.attempt==attempt and s.status==StepStatus.ACTIVE),None)
-    if req.status==RequestStatus.IN_APPROVAL and active and active.workflow_step.assigned_role==role:
-        if active.workflow_step.step_kind==StepKind.APPROVAL and role=="APPROVER" and user.id!=req.created_by:
-            actions.extend(["APPROVE","REJECT"])
-        elif active.workflow_step.step_kind==StepKind.ACTION and ((role=="BID_TEAM" and owner) or (role in {"APPROVER","PACE_COORDINATOR"} and user.id!=req.created_by)):
-            if any(str(field).startswith("attachment:") for field in (active.workflow_step.requires_fields or [])):
-                actions.append("UPLOAD")
-            actions.append("RECORD_REFERENCE" if role=="BID_TEAM" else "COMPLETE")
-    return list(dict.fromkeys(actions))
+        return ["EDIT","UPDATE","UPLOAD","SUBMIT"] if req.status==RequestStatus.DRAFT else (["EDIT","UPDATE"] if req.status==RequestStatus.SUBMITTED else [])
+    if req.status in (RequestStatus.DRAFT,RequestStatus.REJECTED):
+        actions=["EDIT","UPLOAD","SUBMIT"]
+        if req.status==RequestStatus.DRAFT:actions.append("DELETE")
+        return actions
+    if req.status==RequestStatus.COMPLETED and req.type in ("EMD_CHALLAN","EMD_BG") and not req.refund_received_at:
+        return ["REFUND_RECEIVED"]
+    return []
 
 def require_action(req:ComplianceRequest,user:User,action:str)->None:
-    if user.role.name=="ADMIN":
-        raise HTTPException(status_code=403,detail={"error":"forbidden","message":"Administrators have read-only access to compliance requests"})
     if action not in get_allowed_actions(req,user):
         raise HTTPException(status_code=403,detail={"error":"forbidden","message":f"You cannot perform {action.lower().replace('_',' ')} on this request"})
 
 def validate_form(req:ComplianceRequest):
     model=DATA_MODELS.get(req.type)
     if not model: raise HTTPException(422,detail={"error":"validation_error","message":"Unsupported request type"})
-    try: req.form_data=model.model_validate(req.form_data).model_dump(mode="json")
+    try:
+        original=dict(req.form_data or {})
+        validated=model.model_validate(original).model_dump(mode="json")
+        req.form_data={**original,**validated} if req.type in ("TENDER_FEE","EMD_CHALLAN") else validated
     except Exception as exc:
         errors=exc.errors() if hasattr(exc,"errors") else [{"msg":str(exc)}]
         raise HTTPException(422,detail={"error":"validation_error","message":"Form data is invalid","fields":errors})
@@ -73,16 +58,8 @@ def submit(db:Session,req:ComplianceRequest,user:User):
         required=REQUIRED_DOCUMENTS.get(req.type,set())
         missing=sorted(required-have)
         if missing: raise HTTPException(422,detail={"error":"missing_attachments","message":"Upload all required attachments before submitting","missing":missing,"missing_labels":[DOCUMENT_LABELS.get(key,key.replace("_"," ").title()) for key in missing]})
-        template=db.scalar(select(WorkflowTemplate).where(WorkflowTemplate.request_type==req.type,WorkflowTemplate.is_active.is_(True)))
-        configured=sorted([step for step in template.steps if step.version==template.version],key=lambda step:step.step_order) if template else []
-        if not template or not configured: raise HTTPException(409,detail={"error":"workflow_missing","message":"No active workflow is configured for this request type"})
-        old=req.status; attempt=(db.scalar(select(RequestStep.attempt).where(RequestStep.request_id==req.id).order_by(RequestStep.attempt.desc()).limit(1)) or 0)+1
-        for i,step in enumerate(configured):
-            db.add(RequestStep(request=req,step_id=step.id,attempt=attempt,status=StepStatus.ACTIVE if i==0 else StepStatus.PENDING))
-        req.status=RequestStatus.IN_APPROVAL
-        audit(db,user,"SUBMITTED",req,old,req.status,{"attempt":attempt})
-        for assignee in db.scalars(select(User).join(User.role).where(User.role.has(name=configured[0].assigned_role),User.is_active.is_(True))).all():
-            notify(db,assignee.id,f"Request #{req.id} is awaiting {configured[0].name}.",req)
+        old=req.status;req.status=RequestStatus.SUBMITTED
+        audit(db,user,"SUBMITTED",req,old,req.status,{})
     db.flush();return req
 
 def _current(db,req,attempt,step_row_id):

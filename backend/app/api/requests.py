@@ -1,5 +1,5 @@
 import uuid
-from datetime import date,timedelta
+from datetime import date,datetime,timedelta,timezone
 from pathlib import Path
 from fastapi import APIRouter,Depends,HTTPException,UploadFile,File,Form,Body,Response
 from fastapi.responses import FileResponse
@@ -9,6 +9,7 @@ from app.db import get_db
 from app.models import ComplianceRequest,User,Bid,BidChecklistNA,Document,RequestStatus,RequestStep,StepStatus,AuditLog,StepKind
 from app.schemas.requests import RequestCreate,RequestUpdate,DecisionIn,ActionIn,RefundReceivedIn,OmsPaceRedflagData
 from app.core.security import current_user
+from app.core.entered_by import current_entered_by,require_entered_by
 from app.core.config import UPLOAD_DIR,MAX_UPLOAD_MB
 from app.services.workflow_service import (submit,approve,reject,complete_action,audit,
     get_allowed_actions,require_action,REQUIRED_DOCUMENTS,REQUIRED_DOCUMENT_ORDER,DOCUMENT_LABELS)
@@ -61,7 +62,8 @@ def _detail(req,user):
     for doc in sorted(req.documents,key=lambda x:(x.category,x.version)):
         latest[doc.category]=doc
     required_documents=[{"key":key,"label":DOCUMENT_LABELS.get(key,key.replace("_"," ").title()),"uploaded":key in latest,"document_id":latest[key].id if key in latest else None} for key in dict.fromkeys(keys)]
-    return {"id":req.id,"bid_id":req.bid_id,"bid_name":req.bid.client_name if req.bid else "","type":req.type,"status":req.status.value,"form_data":_form_for_user(req.form_data,user,req.created_by),"created_by":req.created_by,"created_by_name":req.creator.full_name if req.creator else "","created_at":req.created_at.isoformat(),"updated_at":req.updated_at.isoformat() if req.updated_at else None,"refund_received_at":req.refund_received_at.isoformat() if req.refund_received_at else None,"documents":[{"id":d.id,"category":d.category,"document_type":d.document_type,"filename":d.filename,"version":d.version,"uploaded_by":d.uploaded_by,"created_at":d.created_at.isoformat()} for d in sorted(req.documents,key=lambda x:(x.category,x.version))],"required_documents":required_documents,"allowed_actions":get_allowed_actions(req,user),"active_step_id":active.id if active else None,"workflow":[{"id":s.id,"step_id":s.step_id,"attempt":s.attempt,"status":s.status.value,"name":s.workflow_step.name,"step_order":s.workflow_step.step_order,"step_kind":s.workflow_step.step_kind.value,"assigned_role":s.workflow_step.assigned_role,"requires_fields":s.workflow_step.requires_fields or [],"acted_by":s.acted_by,"actor_name":s.actor.full_name if s.actor else None,"acted_at":s.acted_at.isoformat() if s.acted_at else None,"comment":s.comment,"extra_data":s.extra_data} for s in sorted(req.steps,key=lambda x:(x.attempt,x.workflow_step.step_order))],"attempt":attempt}
+    creator_name=req.created_by_name or (req.creator.full_name if req.creator else None)
+    return {"id":req.id,"bid_id":req.bid_id,"bid_name":req.bid.client_name if req.bid else "","type":req.type,"status":req.status.value,"form_data":_form_for_user(req.form_data,user,req.created_by),"created_by":req.created_by,"created_by_name":creator_name,"updated_by_name":req.updated_by_name or creator_name,"created_at":req.created_at.isoformat(),"updated_at":req.updated_at.isoformat() if req.updated_at else None,"refund_received_at":req.refund_received_at.isoformat() if req.refund_received_at else None,"documents":[{"id":d.id,"category":d.category,"document_type":d.document_type,"filename":d.filename,"version":d.version,"uploaded_by":d.uploaded_by,"created_at":d.created_at.isoformat()} for d in sorted(req.documents,key=lambda x:(x.category,x.version))],"required_documents":required_documents,"allowed_actions":get_allowed_actions(req,user),"active_step_id":active.id if active else None,"workflow":[{"id":s.id,"step_id":s.step_id,"attempt":s.attempt,"status":s.status.value,"name":s.workflow_step.name,"step_order":s.workflow_step.step_order,"step_kind":s.workflow_step.step_kind.value,"assigned_role":s.workflow_step.assigned_role,"requires_fields":s.workflow_step.requires_fields or [],"acted_by":s.acted_by,"actor_name":s.actor.full_name if s.actor else None,"acted_at":s.acted_at.isoformat() if s.acted_at else None,"comment":s.comment,"extra_data":s.extra_data} for s in sorted(req.steps,key=lambda x:(x.attempt,x.workflow_step.step_order))],"attempt":attempt}
 def _mail_contact_types(req,step=None):
     if req.type in ("TENDER_FEE","EMD_CHALLAN"):return ["PROCESSING"]
     if req.type=="EMD_BG":
@@ -77,7 +79,7 @@ def _mail_event(db,req,step,title,message,comment=""):
     event={"title":title,"message":message,"comment":comment,"template":step.workflow_step.name if step else "request_event"}
     return notify_mail(event,req,_mail_contact_types(req,step),db=db)
 
-@router.post("/parse-checklist")
+@router.post("/parse-checklist",dependencies=[Depends(require_entered_by)])
 async def parse_checklist(file:UploadFile=File(...),request_type:str=Form(...),user:User=Depends(current_user)):
     from app.services.checklist_extractor import InvalidChecklist,parse_checklist_xlsx
     raw=await file.read(MAX_UPLOAD_MB*1024*1024+1)
@@ -118,7 +120,7 @@ def list_requests(page:int=1,page_size:int=20,status:str|None=None,request_type:
     rows=db.scalars(q.offset((page-1)*page_size).limit(page_size)).all()
     return {"items":[{"id":r.id,"bid_id":r.bid_id,"client_name":r.bid.client_name if r.bid else "","bid_name":r.bid.client_name if r.bid else "","type":r.type,"status":r.status.value,"document_count":len(r.documents),"created_at":r.created_at.isoformat(),"updated_at":r.updated_at.isoformat()} for r in rows],"page":page,"page_size":page_size,"total":total,"pages":(total+page_size-1)//page_size}
 
-@router.post("",status_code=201)
+@router.post("",status_code=201,dependencies=[Depends(require_entered_by)])
 def create_request(data:RequestCreate,db:Session=Depends(get_db),user:User=Depends(current_user)):
     if data.type not in {"TENDER_FEE","EMD_CHALLAN","EMD_BG","FINANCIAL_DOCUMENTS","POWER_OF_ATTORNEY","DECLARATION","HR_DOCUMENTS","OMS_PACE_REDFLAG"}:
         raise HTTPException(422,detail={"error":"invalid_request_type","message":"Unknown request type"})
@@ -148,7 +150,7 @@ def request_history(page:int=1,page_size:int=50,date_from:date|None=None,date_to
     return {"items":[{"id":r.id,"bid_id":r.bid_id,"client_name":r.bid.client_name if r.bid else "","type":r.type,"status":r.status.value,"created_at":r.created_at.isoformat()} for r in rows],"page":page,"page_size":page_size,"total":total,"pages":(total+page_size-1)//page_size}
 
 
-@router.delete("/{request_id}",status_code=204)
+@router.delete("/{request_id}",status_code=204,dependencies=[Depends(require_entered_by)])
 def delete_draft_request(request_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req:raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
@@ -163,7 +165,7 @@ def delete_draft_request(request_id:int,db:Session=Depends(get_db),user:User=Dep
     unlink_stored_files(stored_names)
     return Response(status_code=204)
 
-@router.put("/{request_id}")
+@router.put("/{request_id}",dependencies=[Depends(require_entered_by)])
 def update_request(request_id:int,data:RequestUpdate,db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req: raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
@@ -185,7 +187,7 @@ def get_request(request_id:int,db:Session=Depends(get_db),user:User=Depends(curr
     if not req or not can_view_request(req,user): raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
     return _detail(req,user)
 
-@router.post("/{request_id}/documents")
+@router.post("/{request_id}/documents",dependencies=[Depends(require_entered_by)])
 async def upload_document(request_id:int,category:str|None=Form(None),document_type:str|None=Form(None),file:UploadFile=File(...),db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req: raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
@@ -205,6 +207,7 @@ async def upload_document(request_id:int,category:str|None=Form(None),document_t
         except InvalidChecklist as exc:
             raise HTTPException(422,detail={"error":"invalid_checklist","message":str(exc)})
     old=req.status;UPLOAD_DIR.mkdir(parents=True,exist_ok=True);stored=f"{uuid.uuid4().hex}{ext}";(UPLOAD_DIR/stored).write_bytes(raw)
+    req.updated_by_name=current_entered_by.get();req.updated_at=datetime.now(timezone.utc)
     version=(db.scalar(select(Document.version).where(Document.request_id==req.id,Document.category==category).order_by(Document.version.desc()).limit(1)) or 0)+1
     doc=Document(request_id=req.id,category=category,document_type=category,filename=original,stored_name=stored,content_type=file.content_type or "application/octet-stream",version=version,uploaded_by=user.id);db.add(doc);db.flush()
     db.add(AuditLog(user_id=user.id,action="UPLOADED",request_id=req.id,entity_id=req.id,old_status=old.value,new_status=req.status.value,detail={"document_id":doc.id,"category":category,"version":version}));db.commit()
@@ -225,7 +228,7 @@ def download_document(request_id:int,document_id:int,db:Session=Depends(get_db),
     if not path.is_file(): raise HTTPException(404,detail={"error":"not_found","message":"Stored file not found"})
     return FileResponse(path,filename=doc.filename,media_type=doc.content_type)
 
-@router.post("/{request_id}/submit")
+@router.post("/{request_id}/submit",dependencies=[Depends(require_entered_by)])
 def submit_request(request_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req: raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})
@@ -275,7 +278,7 @@ def reject_step(request_id:int,step_id:int,data:DecisionIn,db:Session=Depends(ge
 def complete_step(request_id:int,step_id:int,data:ActionIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     return _step_transition(request_id,step_id,db,user,"complete",extra=data.extra_data)
 
-@router.post("/{request_id}/refund-received")
+@router.post("/{request_id}/refund-received",dependencies=[Depends(require_entered_by)])
 def refund_received(request_id:int,data:RefundReceivedIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     req=_active_request(db,request_id)
     if not req: raise HTTPException(404,detail={"error":"not_found","message":"Request not found"})

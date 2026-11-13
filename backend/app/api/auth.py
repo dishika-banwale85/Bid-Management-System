@@ -1,4 +1,5 @@
 from collections import defaultdict, deque
+import hmac
 from threading import Lock
 from time import monotonic
 
@@ -7,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.config import CAPTCHA_ENABLED, CAPTCHA_PROVIDER, SIGNUP_REQUIRE_ADMIN_APPROVAL
+from app.core.config import ADMIN_SIGNUP_CODE, ALLOWED_EMAIL_DOMAIN, CAPTCHA_ENABLED, CAPTCHA_PROVIDER
 from app.core.security import create_token, current_user, hash_password, verify_password
 from app.db import get_db
 from app.models import AuditLog, Role, User
@@ -27,9 +28,9 @@ _login_window_seconds = 15 * 60
 _login_failure_limit = 5
 
 
-def _login_keys(email: str, request: Request) -> tuple[str, str]:
+def _login_keys(email: str, request: Request) -> tuple[str]:
     ip = request.client.host if request.client else "unknown"
-    return f"email:{email.strip().lower()}", f"ip:{ip}"
+    return (f"ip:{ip}",)
 
 
 def _check_login_lockout(email: str, request: Request) -> None:
@@ -83,7 +84,7 @@ def _session_payload(user: User):
     return {
         "access_token": create_token(user),
         "token_type": "bearer",
-        "user": {"id": user.id, "name": user.full_name, "email": user.email, "role": user.role.name},
+        "user": {"id": user.id, "name": user.full_name, "email": user.email, "role": "ADMIN" if user.role.name == "ADMIN" else "MEMBER"},
     }
 
 
@@ -95,9 +96,10 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
                    captcha_token=data.captcha_token,
                    remote_ip=request.client.host if request.client else None)
     user = db.scalar(select(User).where(func.lower(User.email) == str(data.email).lower()))
-    if not user or not verify_password(data.password, user.password_hash):
+    correct_role = bool(user) and ((data.login_as == "ADMIN" and user.role.name == "ADMIN") or (data.login_as == "MEMBER" and user.role.name != "ADMIN"))
+    if not user or not verify_password(data.password, user.password_hash) or not correct_role:
         _record_failed_login(str(data.email), request)
-        raise HTTPException(401, detail={"error": "unauthorized", "message": "Email or password is incorrect"})
+        raise HTTPException(401, detail={"error": "unauthorized", "message": "Incorrect email, password or role"})
     if not user.is_active:
         raise HTTPException(403, detail={"error": "account_pending", "message": "Your account is waiting for admin approval"})
     _clear_login_failures(str(data.email), request)
@@ -111,13 +113,18 @@ def register(data: RegisterIn, request: Request, db: Session = Depends(get_db)):
                    captcha_token=data.captcha_token,
                    remote_ip=request.client.host if request.client else None)
     email = str(data.email).strip().lower()
+    if ALLOWED_EMAIL_DOMAIN and email.rsplit("@", 1)[-1] != ALLOWED_EMAIL_DOMAIN:
+        raise HTTPException(422, detail={"error": "email_domain_not_allowed", "message": f"Use an email address from {ALLOWED_EMAIL_DOMAIN}"})
+    if data.role == "ADMIN" and (not ADMIN_SIGNUP_CODE or not data.admin_code or not hmac.compare_digest(data.admin_code, ADMIN_SIGNUP_CODE)):
+        raise HTTPException(422, detail={"error": "invalid_admin_code", "message": "Admin code is incorrect"})
     if db.scalar(select(User.id).where(func.lower(User.email) == email)):
         raise HTTPException(409, detail={"error": "email_registered", "message": "This email is already registered"})
 
-    role = db.scalar(select(Role).where(Role.name == data.role))
+    stored_role = "ADMIN" if data.role == "ADMIN" else "BID_TEAM"
+    role = db.scalar(select(Role).where(Role.name == stored_role))
     if not role:
         raise HTTPException(503, detail={"error": "roles_not_seeded", "message": "Account roles are not configured. Run the database seed first."})
-    active = not (SIGNUP_REQUIRE_ADMIN_APPROVAL and data.role in {"APPROVER", "PACE_COORDINATOR"})
+    active = True
     user = User(email=email, full_name=data.full_name, password_hash=hash_password(data.password), role=role, is_active=active)
     db.add(user)
     try:
@@ -126,12 +133,10 @@ def register(data: RegisterIn, request: Request, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(409, detail={"error": "email_registered", "message": "This email is already registered"})
 
-    db.add(AuditLog(user_id=user.id, action="USER_REGISTERED", entity_type="User", entity_id=user.id, detail={"email": email, "role": data.role}))
+    db.add(AuditLog(user_id=user.id, action="USER_REGISTERED", entity_type="User", entity_id=user.id, detail={"email": email, "role": stored_role}))
     db.commit()
     db.refresh(user)
-    if not user.is_active:
-        return {"account_created": True, "pending_approval": True, "message": "Your account is waiting for admin approval"}
-    return {"account_created": True, **_session_payload(user)}
+    return {"account_created": True, "message": "Account created"}
 
 
 @router.get("/captcha")
@@ -144,4 +149,4 @@ def get_captcha(db: Session = Depends(get_db)):
 
 @router.get("/me")
 def me(user: User = Depends(current_user)):
-    return {"id": user.id, "name": user.full_name, "email": user.email, "role": user.role.name}
+    return {"id": user.id, "name": user.full_name, "email": user.email, "role": "ADMIN" if user.role.name == "ADMIN" else "MEMBER"}

@@ -8,13 +8,14 @@ from app.models import User,Role,WorkflowTemplate,WorkflowStep,StepKind,FormTemp
 from app.schemas.admin import REQUEST_TYPES,WorkflowUpdateIn,FormTemplateUpdateIn,ContactAdminIn,UserCreateIn,UserUpdateIn
 from app.schemas.requests import TenderFeeData,EmdChallanData,EmdBgData,FinancialDocumentsData,PowerOfAttorneyData,DeclarationData,HRDocumentsData
 from app.core.security import require_role,current_user,hash_password
+from app.core.entered_by import require_entered_by
 from app.services.trash_service import empty_old_trash
 
 router=APIRouter(prefix="/admin",tags=["admin"])
 _FORM_MODELS={"TENDER_FEE":TenderFeeData,"EMD_CHALLAN":EmdChallanData,"EMD_BG":EmdBgData,"FINANCIAL_DOCUMENTS":FinancialDocumentsData,"POWER_OF_ATTORNEY":PowerOfAttorneyData,"DECLARATION":DeclarationData,"HR_DOCUMENTS":HRDocumentsData}
 
 
-@router.post("/trash/empty")
+@router.post("/trash/empty",dependencies=[Depends(require_entered_by)])
 def empty_bid_trash(db:Session=Depends(get_db),user:User=Depends(require_role("ADMIN"))):
     removed=empty_old_trash(db,user.id)
     return {"deleted_count":removed}

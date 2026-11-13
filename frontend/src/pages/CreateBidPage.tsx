@@ -19,7 +19,7 @@ function SectionHeading({icon,title}:{icon:ReactNode;title:string}){return <div 
 const bidStatusLabels:Record<BidStatus,string>={SUBMITTED:'Submitted',NOT_SUBMITTED:'Not submitted',WIN:'Win',WITHDRAW:'Withdraw',LOSE:'Lose'};
 export default function CreateBidPage({user}:{user?:User|null}){
  const navigate=useNavigate();const queryClient=useQueryClient();const [duplicate,setDuplicate]=useState(false);const [duplicateLoading,setDuplicateLoading]=useState(false);const [submitError,setSubmitError]=useState('');
- const [rfpFile,setRfpFile]=useState<File|null>(null),[rfpFileError,setRfpFileError]=useState('');const canManage=user?.role==='BID_TEAM';
+ const [rfpFile,setRfpFile]=useState<File|null>(null),[rfpFileError,setRfpFileError]=useState('');const canManage=!!user;
  const form=useForm<BidCreateForm,unknown,BidCreateValues>({resolver:zodResolver(bidCreateSchema) as Resolver<BidCreateForm,unknown,BidCreateValues>,mode:'onBlur',defaultValues:{client_name:'',department:'',client_address:'',rfp_number:'',project_title:'',rfp_published_date:'',prebid_query_deadline:'',prebid_query_na:false,prebid_meeting_date:'',prebid_meeting_na:false,submission_deadline:'',tender_opening_date:'',bid_status:'NOT_SUBMITTED'}});
  const values=form.watch();const errors=form.formState.errors;
  const timeline=useMemo(()=>[

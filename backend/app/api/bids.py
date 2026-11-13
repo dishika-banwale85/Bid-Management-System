@@ -10,6 +10,7 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.security import current_user
+from app.core.entered_by import current_entered_by,require_entered_by
 from app.core.config import UPLOAD_DIR
 from app.db import get_db
 from app.models import AuditLog, Bid, BidChecklistNA, BidDocument, BidStatus, ComplianceRequest, Document, RequestStatus, User
@@ -104,6 +105,9 @@ def bid_json(b,user=None,checklist=None,stats=None):
         "bid_status":b.bid_status.value if hasattr(b.bid_status,"value") else b.bid_status,
         "rfp":{"id":b.rfp_document.id,"filename":b.rfp_document.original_name,"size":b.rfp_document.size,"uploaded_at":b.rfp_document.uploaded_at.isoformat()} if b.rfp_document else None,
         "can_manage_bid":bool(user),
+        "created_by_name":b.created_by_name or (b.creator.full_name if b.creator else None),
+        "updated_by_name":b.updated_by_name or b.created_by_name or (b.creator.full_name if b.creator else None),
+        "updated_at":(b.updated_at or b.created_at).isoformat() if (b.updated_at or b.created_at) else None,
         "request_count":total,
         "completed_count":complete,
         "progress":round(complete*100/total) if total else 0,
@@ -174,7 +178,7 @@ def list_bid_trash(page:int=1,page_size:int=20,db:Session=Depends(get_db),user:U
 @router.get("",response_model=list[BidOut])
 def list_bids(search:str|None=None,q:str|None=None,date_from:date|None=None,date_to:date|None=None,client:str|None=None,request_type:str|None=None,tab:str|None=None,status:str|None=None,bid_status:BidStatus|None=None,checklist_bucket:str|None=None,submission_month:str|None=None,overdue:bool|None=None,db:Session=Depends(get_db),user:User=Depends(current_user)):
     search=(search or q or "").strip()
-    statement=select(Bid).options(selectinload(Bid.requests),selectinload(Bid.rfp_document)).where(bid_visibility_clause(user))
+    statement=select(Bid).options(selectinload(Bid.requests),selectinload(Bid.rfp_document),selectinload(Bid.creator)).where(bid_visibility_clause(user))
     if bid_status:statement=statement.where(Bid.bid_status==bid_status)
     if search:
         pattern=f"%{search}%"
@@ -247,7 +251,7 @@ async def _parse_create_bid(request:Request):
     return data,None,None,None
 
 
-@router.post("",response_model=BidOut,status_code=201)
+@router.post("",response_model=BidOut,status_code=201,dependencies=[Depends(require_entered_by)])
 async def create_bid(request:Request,db:Session=Depends(get_db),user:User=Depends(current_user)):
     data,uploaded,raw,file_info=await _parse_create_bid(request)
     if data.bid_status==BidStatus.SUBMITTED and not uploaded:
@@ -281,7 +285,7 @@ async def create_bid(request:Request,db:Session=Depends(get_db),user:User=Depend
 
 @router.get("/{bid_id}",response_model=BidDetailOut)
 def get_bid(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    bid=db.scalar(select(Bid).options(selectinload(Bid.requests),selectinload(Bid.rfp_document)).where(Bid.id==bid_id,bid_visibility_clause(user)))
+    bid=db.scalar(select(Bid).options(selectinload(Bid.requests),selectinload(Bid.rfp_document),selectinload(Bid.creator)).where(Bid.id==bid_id,bid_visibility_clause(user)))
     if not bid:
         deleted=db.scalar(select(Bid).where(Bid.id==bid_id,Bid.deleted_at.is_not(None)))
         if deleted:
@@ -297,9 +301,10 @@ def _owned_bid_for_rfp_write(db:Session,bid_id:int,user:User)->Bid:
     return bid
 
 
-@router.post("/{bid_id}/rfp")
+@router.post("/{bid_id}/rfp",dependencies=[Depends(require_entered_by)])
 async def upload_bid_rfp(bid_id:int,file:UploadFile=File(...),db:Session=Depends(get_db),user:User=Depends(current_user)):
     bid=_owned_bid_for_rfp_write(db,bid_id,user)
+    bid.updated_by_name=current_entered_by.get();bid.updated_at=datetime.now(timezone.utc)
     raw=await file.read(MAX_RFP_BYTES+1)
     try:
         extension,content_type=validate_rfp_file(file.filename or "",raw)
@@ -338,9 +343,10 @@ def download_bid_rfp(bid_id:int,db:Session=Depends(get_db),user:User=Depends(cur
     return FileResponse(path,filename=document.original_name,media_type=document.content_type)
 
 
-@router.delete("/{bid_id}/rfp",status_code=204)
+@router.delete("/{bid_id}/rfp",status_code=204,dependencies=[Depends(require_entered_by)])
 def remove_bid_rfp(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     bid=_owned_bid_for_rfp_write(db,bid_id,user)
+    bid.updated_by_name=current_entered_by.get();bid.updated_at=datetime.now(timezone.utc)
     document=bid.rfp_document
     if not document:raise HTTPException(404,detail={"error":"not_found","message":"No RFP file is attached to this bid"})
     stored=document.stored_name
@@ -349,7 +355,7 @@ def remove_bid_rfp(bid_id:int,db:Session=Depends(get_db),user:User=Depends(curre
     return Response(status_code=204)
 
 
-@router.delete("/{bid_id}")
+@router.delete("/{bid_id}",dependencies=[Depends(require_entered_by)])
 def move_bid_to_trash(bid_id:int,data:BidDeleteIn|None=Body(default=None),db:Session=Depends(get_db),user:User=Depends(current_user)):
     bid=get_active_bid(db,bid_id)
     if bid is None:raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
@@ -363,7 +369,7 @@ def move_bid_to_trash(bid_id:int,data:BidDeleteIn|None=Body(default=None),db:Ses
     return {"id":bid.id,"deleted_at":bid.deleted_at.isoformat(),"message":"Bid moved to Trash"}
 
 
-@router.post("/{bid_id}/restore")
+@router.post("/{bid_id}/restore",dependencies=[Depends(require_entered_by)])
 def restore_bid(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     bid=db.scalar(select(Bid).where(Bid.id==bid_id,Bid.deleted_at.is_not(None)))
     if bid is None:raise HTTPException(409,detail={"error":"conflict","message":"This bid is not in Trash"})
@@ -376,7 +382,7 @@ def restore_bid(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_
     return {"id":bid.id,"message":"Bid restored"}
 
 
-@router.delete("/{bid_id}/permanent",status_code=204)
+@router.delete("/{bid_id}/permanent",status_code=204,dependencies=[Depends(require_entered_by)])
 def permanently_delete_bid_route(bid_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     bid=db.get(Bid,bid_id)
     if bid is None:raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
@@ -422,10 +428,11 @@ def get_bid_checklist(bid_id:int,db:Session=Depends(get_db),user:User=Depends(cu
     return {"bid_id":bid.id,"request_types":type_data,"required_total":required_total,"attached_total":attached_total,"missing_total":missing_total,"percent":int(attached_total*100/required_total+0.5) if required_total else 0,"can_mark_na":True}
 
 
-@router.put("/{bid_id}/checklist/na")
+@router.put("/{bid_id}/checklist/na",dependencies=[Depends(require_entered_by)])
 def set_checklist_applicability(bid_id:int,data:BidChecklistNAIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     bid=get_active_bid(db,bid_id)
     if not bid:raise HTTPException(404,detail={"error":"not_found","message":"Bid not found"})
+    bid.updated_by_name=current_entered_by.get();bid.updated_at=datetime.now(timezone.utc)
     if data.request_type not in REQUIRED_DOCUMENT_ORDER:
         raise HTTPException(422,detail={"error":"invalid_request_type","message":"This request type is not active"})
     existing=db.get(BidChecklistNA,(bid_id,data.request_type))
@@ -442,8 +449,8 @@ def set_checklist_applicability(bid_id:int,data:BidChecklistNAIn,db:Session=Depe
     return get_bid_checklist(bid_id,db,user)
 
 
-@router.put("/{bid_id}",response_model=BidOut)
-@router.patch("/{bid_id}",response_model=BidOut)
+@router.put("/{bid_id}",response_model=BidOut,dependencies=[Depends(require_entered_by)])
+@router.patch("/{bid_id}",response_model=BidOut,dependencies=[Depends(require_entered_by)])
 def update_bid(bid_id:int,data:BidUpdate,db:Session=Depends(get_db),user:User=Depends(current_user)):
     bid=get_active_bid(db,bid_id)
     if not bid:

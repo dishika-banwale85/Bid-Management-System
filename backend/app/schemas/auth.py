@@ -9,7 +9,8 @@ class RegisterIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     confirm_password: str = Field(min_length=8, max_length=128)
-    role: Literal["BID_TEAM", "APPROVER", "PACE_COORDINATOR"]
+    role: Literal["MEMBER", "ADMIN"] = "MEMBER"
+    admin_code: str | None = Field(default=None, max_length=200)
     captcha_id: str | None = None
     captcha_answer: str | None = None
     captcha_token: str | None = None

@@ -34,12 +34,10 @@ def current_user(token: str = Depends(oauth2), db: Session = Depends(get_db)) ->
 
 def require_role(*roles: str):
     def dependency(user: User = Depends(current_user)):
-        if user.role.name not in roles:
+        if roles == ("ADMIN",) and user.role.name != "ADMIN":
             raise HTTPException(status_code=403, detail={"error":"forbidden","message":"Role is not permitted for this action"})
         return user
     return dependency
 
 def deny_admin_writes(user: User = Depends(current_user)) -> User:
-    if user.role.name=="ADMIN":
-        raise HTTPException(status_code=403,detail={"error":"forbidden","message":"Administrators have read-only access to compliance requests"})
     return user

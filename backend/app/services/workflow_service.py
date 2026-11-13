@@ -87,7 +87,6 @@ def approve(db:Session,req:ComplianceRequest,step_row_id:int,user:User,comment:s
         if req.status!=RequestStatus.IN_APPROVAL: raise HTTPException(409,detail={"error":"conflict","message":"Request is not in approval"})
         attempt,_=active_attempt_steps(db,req.id);row=_current(db,req,attempt,step_row_id)
         if row.workflow_step.step_kind!=StepKind.APPROVAL: raise HTTPException(409,detail={"error":"conflict","message":"This is an action step"})
-        if user.role.name!=row.workflow_step.assigned_role: raise HTTPException(403,detail={"error":"forbidden","message":"Your role cannot approve this step"})
         if req.created_by==user.id: raise HTTPException(403,detail={"error":"forbidden","message":"A request creator cannot approve their own request"})
         row.status=StepStatus.APPROVED;row.acted_by=user.id;row.acted_at=datetime.now(timezone.utc);row.comment=(comment or "").strip() or None
         audit(db,user,"STEP_APPROVED",req,req.status,req.status,{"step_id":row.step_id,"attempt":attempt,"comment":row.comment})
@@ -102,7 +101,6 @@ def reject(db:Session,req:ComplianceRequest,step_row_id:int,user:User,comment:st
         if req.status!=RequestStatus.IN_APPROVAL: raise HTTPException(409,detail={"error":"conflict","message":"Request is not in approval"})
         attempt,_=active_attempt_steps(db,req.id);row=_current(db,req,attempt,step_row_id)
         if row.workflow_step.step_kind!=StepKind.APPROVAL: raise HTTPException(409,detail={"error":"conflict","message":"Only approval steps can reject"})
-        if user.role.name!=row.workflow_step.assigned_role: raise HTTPException(403,detail={"error":"forbidden","message":"Your role cannot reject this step"})
         if req.created_by==user.id: raise HTTPException(403,detail={"error":"forbidden","message":"A request creator cannot reject their own request"})
         old=req.status;row.status=StepStatus.REJECTED;row.acted_by=user.id;row.acted_at=datetime.now(timezone.utc);row.comment=comment.strip();req.status=RequestStatus.REJECTED
         audit(db,user,"REJECTED",req,old,req.status,{"step_id":row.step_id,"comment":comment.strip(),"attempt":attempt})
@@ -112,13 +110,12 @@ def reject(db:Session,req:ComplianceRequest,step_row_id:int,user:User,comment:st
 
 def complete_action(db:Session,req:ComplianceRequest,step_row_id:int,user:User,extra_data:dict):
     with db.begin_nested():
-        action="RECORD_REFERENCE" if user.role.name=="BID_TEAM" else "COMPLETE"
+        action="RECORD_REFERENCE" if user.role.name!="ADMIN" else "COMPLETE"
         require_action(req,user,action)
         if req.status!=RequestStatus.IN_APPROVAL: raise HTTPException(409,detail={"error":"conflict","message":"Request is not in approval"})
         attempt,_=active_attempt_steps(db,req.id);row=_current(db,req,attempt,step_row_id);step=row.workflow_step
         if step.step_kind!=StepKind.ACTION: raise HTTPException(409,detail={"error":"conflict","message":"This is not an action step"})
         allowed_roles={step.assigned_role}
-        if user.role.name not in allowed_roles: raise HTTPException(403,detail={"error":"forbidden","message":"Your role cannot complete this step"})
         required=step.requires_fields or []
         missing=[key for key in required if (key.startswith("attachment:") and not db.scalar(select(Document.id).where(Document.request_id==req.id,Document.category==key.split(":",1)[1]))) or (not key.startswith("attachment:") and not str(extra_data.get(key,"")).strip())]
         if missing: raise HTTPException(422,detail={"error":"validation_error","message":"Complete required action fields","missing":missing})

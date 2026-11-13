@@ -54,7 +54,7 @@ class PowerOfAttorneyData(MailTrackingData):
     # Ignore the removed legacy fields when a saved draft is resubmitted.
     model_config=ConfigDict(extra="ignore")
     signatory_name:str=Field(min_length=1)
-    validity_period:int=Field(gt=0); rfp_format_attached:bool
+    validity_period:int=Field(gt=0)
 class DeclarationData(MailTrackingData):
     # Ignore the removed legacy Subject field when resubmitting an existing draft.
     model_config=ConfigDict(extra="ignore")
@@ -71,19 +71,34 @@ class OmsPaceRedflagData(MailTrackingData):
     pace_id:str|None=None
     approval_status:Literal["PENDING","APPROVED"]|None=None
     red_flag_status:Literal["INITIATED","NOT_INITIATED"]
+    red_flag_mail_to:str|None=Field(default=None,min_length=2,max_length=80)
+    prebid_mail_reshared:Literal["Yes","No"]|None=None
+    prebid_mail_to:str|None=Field(default=None,min_length=2,max_length=80)
     @field_validator("oms_id","pace_id",mode="before")
     @classmethod
     def clean_id(cls,v):
         if v is None:return None
         v=v.strip() if isinstance(v,str) else v
-        if not isinstance(v,str) or len(v)>60 or (v and not __import__("re").fullmatch(r"[A-Za-z0-9 /_-]+",v)):raise ValueError("Use up to 60 letters, numbers, spaces, dashes, slashes or underscores")
+        if not isinstance(v,str):raise ValueError("Enter text")
+        if len(v)>60:raise ValueError("Use up to 60 letters, numbers, spaces, dashes, slashes or underscores")
+        if v and not __import__("re").fullmatch(r"[A-Za-z0-9 /_-]+",v):raise ValueError("Use up to 60 letters, numbers, spaces, dashes, slashes or underscores")
         return v or None
+    @field_validator("red_flag_mail_to","prebid_mail_to",mode="before")
+    @classmethod
+    def clean_mail_to(cls,v):
+        if v is None:return None
+        if not isinstance(v,str):raise ValueError("Enter a name")
+        return v.strip() or None
     @model_validator(mode="after")
     def dependent_fields(self):
         if self.oms_created=="Yes" and not self.oms_id:raise ValueError("OMS ID is required when OMS created is Yes")
         if self.pace_created=="Yes" and (not self.pace_id or not self.approval_status):raise ValueError("PACE ID and Approval are required when PACE created is Yes")
         if self.oms_created=="No" and self.oms_id:raise ValueError("OMS ID must be empty when OMS created is No")
         if self.pace_created=="No" and (self.pace_id or self.approval_status):raise ValueError("PACE fields must be empty when PACE created is No")
+        if self.red_flag_status=="INITIATED" and not self.red_flag_mail_to:raise ValueError("Mail sent to is required when Red flag initiated is Yes")
+        if self.red_flag_status=="NOT_INITIATED" and self.red_flag_mail_to:raise ValueError("Mail sent to must be empty when Red flag initiated is No")
+        if self.prebid_mail_reshared=="Yes" and not self.prebid_mail_to:raise ValueError("Mail sent to is required when Pre-bid mail is Yes")
+        if self.prebid_mail_reshared=="No" and self.prebid_mail_to:raise ValueError("Mail sent to must be empty when Pre-bid mail is No")
         return self
 
 class RequestCreate(BaseModel): bid_id:int; type:Literal["TENDER_FEE","EMD_CHALLAN","EMD_BG","FINANCIAL_DOCUMENTS","POWER_OF_ATTORNEY","DECLARATION","HR_DOCUMENTS","OMS_PACE_REDFLAG"]; form_data:dict=Field(default_factory=dict)
@@ -91,6 +106,7 @@ class RequestUpdate(BaseModel): form_data:dict
 class LoginIn(BaseModel):
     email:EmailStr
     password:str
+    login_as:Literal["MEMBER","ADMIN"]="MEMBER"
     captcha_id:str|None=None
     captcha_answer:str|None=None
     captcha_token:str|None=None
@@ -197,6 +213,9 @@ class BidOut(BaseModel):
     status:str
     bid_status:BidStatus=BidStatus.NOT_SUBMITTED
     rfp:dict|None=None
+    created_by_name:str|None=None
+    updated_by_name:str|None=None
+    updated_at:datetime|None=None
     can_manage_bid:bool=False
     request_count:int=0
     completed_count:int=0

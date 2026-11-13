@@ -20,6 +20,8 @@ SMTP_FROM = os.getenv("SMTP_FROM", "no-reply@bidease.local")
 SMTP_TLS = os.getenv("SMTP_TLS", "false").lower() == "true"
 MAIL_MODE = os.getenv("MAIL_MODE", "simulate").strip().lower()
 SIGNUP_REQUIRE_ADMIN_APPROVAL = os.getenv("SIGNUP_REQUIRE_ADMIN_APPROVAL", "false").strip().lower() in {"1", "true", "yes", "on"}
+ADMIN_SIGNUP_CODE = os.getenv("ADMIN_SIGNUP_CODE", "")
+ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "").strip().lower().lstrip("@")
 CAPTCHA_ENABLED = os.getenv("CAPTCHA_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 CAPTCHA_PROVIDER = os.getenv("CAPTCHA_PROVIDER", "local").strip().lower()
 if CAPTCHA_PROVIDER not in {"local", "turnstile", "recaptcha"}:

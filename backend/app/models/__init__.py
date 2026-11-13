@@ -1,6 +1,6 @@
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, Date, DateTime, ForeignKey, Text, Boolean, JSON, Enum, UniqueConstraint, Index
+from sqlalchemy import String, Integer, Date, DateTime, ForeignKey, Text, Boolean, JSON, Enum, UniqueConstraint, Index, event
 from sqlalchemy.types import TypeDecorator
 import os, json, base64, hashlib
 from cryptography.fernet import Fernet
@@ -67,11 +67,15 @@ class Bid(Base):
     status: Mapped[str]=mapped_column(String(40),default="IN_PROGRESS",index=True)
     bid_status: Mapped[BidStatus]=mapped_column(Enum(BidStatus,native_enum=False,create_constraint=True,name="bid_status_values",length=20),default=BidStatus.NOT_SUBMITTED,server_default="NOT_SUBMITTED",nullable=False,index=True)
     created_by: Mapped[int]=mapped_column(ForeignKey("users.id"),index=True)
+    created_by_name: Mapped[str|None]=mapped_column(String(80),nullable=True)
+    updated_by_name: Mapped[str|None]=mapped_column(String(80),nullable=True)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+    updated_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True),default=now,onupdate=now,nullable=True)
     deleted_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True,index=True)
     deleted_by: Mapped[int|None]=mapped_column(ForeignKey("users.id"),nullable=True,index=True)
     delete_reason: Mapped[str|None]=mapped_column(Text,nullable=True)
     deleter: Mapped[User|None]=relationship(foreign_keys=[deleted_by])
+    creator: Mapped[User]=relationship(foreign_keys=[created_by])
     requests: Mapped[list["ComplianceRequest"]]=relationship(back_populates="bid")
     rfp_document: Mapped["BidDocument|None"]=relationship(back_populates="bid",cascade="all, delete-orphan",uselist=False)
 
@@ -103,6 +107,8 @@ class ComplianceRequest(Base):
     legacy_status: Mapped[str|None]=mapped_column(String(20),nullable=True)
     form_data: Mapped[dict]=mapped_column(EncryptedJSON(),default=dict)
     created_by: Mapped[int]=mapped_column(ForeignKey("users.id"),index=True)
+    created_by_name: Mapped[str|None]=mapped_column(String(80),nullable=True)
+    updated_by_name: Mapped[str|None]=mapped_column(String(80),nullable=True)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
     updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,onupdate=now)
     refund_received_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True,index=True)
@@ -219,7 +225,31 @@ class AuditLog(Base):
     old_status: Mapped[str|None]=mapped_column(String(30),nullable=True)
     new_status: Mapped[str|None]=mapped_column(String(30),nullable=True)
     detail: Mapped[dict]=mapped_column(JSON,default=dict)
+    entered_by: Mapped[str|None]=mapped_column(String(80),nullable=True)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now,index=True)
+
+from app.core.entered_by import current_entered_by
+
+@event.listens_for(Bid,"before_insert")
+@event.listens_for(ComplianceRequest,"before_insert")
+def _set_creation_names(mapper,connection,target):
+    name=current_entered_by.get()
+    if name:
+        if target.created_by_name is None:target.created_by_name=name
+        if target.updated_by_name is None:target.updated_by_name=name
+
+@event.listens_for(Bid,"before_update")
+@event.listens_for(ComplianceRequest,"before_update")
+def _set_update_names(mapper,connection,target):
+    name=current_entered_by.get()
+    if name:
+        target.updated_by_name=name
+        target.updated_at=now()
+
+@event.listens_for(AuditLog,"before_insert")
+def _set_audit_entered_by(mapper,connection,target):
+    if target.entered_by is None:
+        target.entered_by=current_entered_by.get()
 
 class ReminderSent(Base):
     __tablename__="reminders_sent"
